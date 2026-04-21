@@ -10,14 +10,16 @@ public class JobWorkerHosterService : BackgroundService
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly IJobQueue _jobQueue;
+    private readonly IJobExecutionCancellationRegistry _jobExecutionCancellationRegistry;
     private readonly ILogger<JobWorkerHosterService> _logger;
     private readonly List<Task> _workerTasks = [];
 
-    public JobWorkerHosterService(IServiceScopeFactory scopeFactory, IJobQueue jobQueue,
+    public JobWorkerHosterService(IServiceScopeFactory scopeFactory, IJobQueue jobQueue,IJobExecutionCancellationRegistry jobExecutionCancellationRegistry,
         ILogger<JobWorkerHosterService> logger)
     {
         _scopeFactory = scopeFactory;
         _jobQueue = jobQueue;
+        _jobExecutionCancellationRegistry = jobExecutionCancellationRegistry;
         _logger = logger;
     }
 
@@ -97,13 +99,16 @@ public class JobWorkerHosterService : BackgroundService
 
         try
         {
+            using var jobCancellationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _jobExecutionCancellationRegistry.Register(jobId, jobCancellationCts);
+
             var originalSizeBytes = GetFileSizeSafe(job.SourcePath);
             var sourceFormat = GetExtensionOrUnknown(job.SourcePath);
             var targetFormat = string.IsNullOrWhiteSpace(job.TargetFormat)
                 ? "unknown"
                 : job.TargetFormat.ToLowerInvariant();
             var audioMode = ResolveAudioMode(targetFormat, job.AudioMode);
-            var resultPath = await processor.ProcessAsync(job, cancellationToken);
+            var resultPath = await processor.ProcessAsync(job, jobCancellationCts.Token);
             var convertedSizeBytes = GetFileSizeSafe(resultPath);
 
             job.Status = JobStatus.Completed;
@@ -121,10 +126,34 @@ public class JobWorkerHosterService : BackgroundService
                         cancellationToken);
                 }
 
-                var message =
-                    $"Conversion completed successfully! Original file size: {originalSizeBytes} bytes, converted file size: {convertedSizeBytes} bytes, source format: {sourceFormat}, target format: {targetFormat}, audio mode: {audioMode}";
+                var message = BuildCompletionMessage(sourceFormat, targetFormat, audioMode, originalSizeBytes,
+                    convertedSizeBytes);
                 var sent = await notifier.NotifyResultAsync(job.User.TelegramChatId.Value, resultPath, message,
                     cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            job.Status = JobStatus.Cancelled;
+            job.ErrorMessage = "Cancelled by user";
+            job.CompletedAt = DateTime.UtcNow;
+            await UpdateQueueStateAsync(dbContext, jobId, job.Status, cancellationToken);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            if (job.User.TelegramChatId.HasValue)
+            {
+                if (job.ProgressMessageId.HasValue)
+                {
+                    await notifier.UpdateProgressMessageAsync(job.User.TelegramChatId.Value,
+                        job.ProgressMessageId.Value,
+                        "Processing cancelled by user!",
+                        cancellationToken);
+                }
+                else
+                {
+                    await notifier.NotifyAsync(job.User.TelegramChatId.Value,
+                        "Processing cancelled by user!",
+                        cancellationToken);
+                }
             }
         }
         catch (Exception e)
@@ -145,12 +174,54 @@ public class JobWorkerHosterService : BackgroundService
                 }
                 else
                 {
-                    
+                    await notifier.NotifyAsync(job.User.TelegramChatId.Value,
+                        "Processing failed!",
+                        cancellationToken);
                 }
             }
         }
+        finally
+        {
+            _jobExecutionCancellationRegistry.Unregister(jobId);
+        }
     }
 
+    private string BuildCompletionMessage(string sourceFormat, string targetFormat, string audioMode,
+        long originalSizeBytes, long convertedSizeBytes)
+    {
+        var diffPercent = originalSizeBytes > 0
+            ? ((double)(convertedSizeBytes - originalSizeBytes) / originalSizeBytes) * 100.0
+            : 0;
+
+        var direction = diffPercent <= 0 ? "smaller" : "larger";
+        var absPercent = Math.Abs(diffPercent);
+
+        return $"Processing completed successfully.\n" +
+               $"Format: {sourceFormat} → {targetFormat}\n" +
+               $"Audio: {audioMode}\n" +
+               $"Size: {FormatBytes(originalSizeBytes)} → {FormatBytes(convertedSizeBytes)}\n" +
+               $"Change: {absPercent:F1}% {direction}";
+    }
+
+    private string FormatBytes(long bytes)
+    {
+        if (bytes<=0)
+        {
+            return "0 B";
+        }
+
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var size=(double)bytes;
+        var unitIndex = 0;
+        while (size>=1024 && unitIndex < units.Length - 1)
+        {
+            size /= 1024;
+            unitIndex++;
+        }
+
+        return $"{size:F2} {units[unitIndex]}";
+    }
+    
     private long GetFileSizeSafe(string? path)
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))

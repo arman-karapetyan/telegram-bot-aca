@@ -5,6 +5,7 @@ using telegram_bot_aca.Bot.Commands;
 using telegram_bot_aca.Data;
 using telegram_bot_aca.Services;
 using Telegram.Bot;
+using Telegram.Bot.Types;
 
 namespace telegram_bot_aca;
 
@@ -16,6 +17,9 @@ public class Program
 
         var connectionString = "Data Source=telegrambotaca.db";
         builder.Services.AddDbContext<AppDbContext>(options => options.UseSqlite(connectionString));
+        var telegramOptionsAtStartup =
+            builder.Configuration.GetSection(TelegramBotOptions.SectionName).Get<TelegramBotOptions>() ??
+            new TelegramBotOptions();
         
         // Add services to the container.
 
@@ -40,6 +44,7 @@ public class Program
         builder.Services.AddScoped<ITelegramCommand, StartCommand>();
         builder.Services.AddScoped<ITelegramCommand, RegisterCommand>();
         builder.Services.AddScoped<ITelegramCommand, MediaUploadCommand>();
+        builder.Services.AddScoped<ITelegramCommand, CancelCommand>();
         builder.Services.AddScoped<ITelegramCommand, PendingConversionCommand>();
 
         builder.Services.AddSingleton<IConversionSessionStore, InMemoryConversionSessionStore>();
@@ -47,9 +52,11 @@ public class Program
         builder.Services.AddSingleton<ITelegramUpdateHandler, TelegramUpdateHandler>();
 
         builder.Services.AddSingleton<IJobQueue, JobQueue>();
+        builder.Services.AddSingleton<IJobExecutionCancellationRegistry, JobExecutionCancellationRegistry>();
 
         builder.Services.AddScoped<IJobProcessor, MediaConversionJobProcessor>();
         builder.Services.AddScoped<IJobSubmissionService, JobSubmissionService>();
+        builder.Services.AddScoped<IJobCancellationService, JobCancellationService>();
 
         builder.Services.AddSingleton<INotificationService, TelegramNotificationService>();
         builder.Services.AddHostedService<TelegramBotInitializer>();
@@ -58,6 +65,26 @@ public class Program
         
         var app = builder.Build();
 
+
+        if (!string.IsNullOrWhiteSpace(telegramOptionsAtStartup?.Token))
+        {
+            if (telegramOptionsAtStartup.CommunicationMode == BotCommunicationMode.Webhook)
+            {
+                var webhookPath = string.IsNullOrWhiteSpace(telegramOptionsAtStartup.WebHookPath)
+                    ? "/telegram/webhook"
+                    : telegramOptionsAtStartup.WebHookPath;
+                app.MapPost(webhookPath,
+                    async (
+                        HttpRequest httpRequest,
+                        Update update,
+                        ITelegramUpdateHandler updateHandler,
+                        CancellationToken cancellationToken) =>
+                    {
+                        await updateHandler.HandleUpdateAsync(update, cancellationToken);
+                        return Results.Ok();
+                    });
+            }
+        }
         // Configure the HTTP request pipeline.
         if (app.Environment.IsDevelopment())
         {

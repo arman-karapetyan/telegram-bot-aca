@@ -13,7 +13,20 @@ public class TelegramNotificationService : INotificationService
         _botClient = botClient;
         _logger = logger;
     }
-    
+
+    public async Task NotifyAsync(long chatId, string message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _botClient.SendMessage(chatId, message, cancellationToken: cancellationToken);
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "Failed to send notification to chat {ChatId}: {Message}", chatId, message);
+        }
+    }
+
+
     public async Task<int?> SendProgressMessageAsync(long chatId, string message, CancellationToken cancellationToken)
     {
         try

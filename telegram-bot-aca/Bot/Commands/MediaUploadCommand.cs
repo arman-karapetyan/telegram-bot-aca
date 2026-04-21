@@ -3,6 +3,7 @@ using telegram_bot_aca.Data.Entites;
 using telegram_bot_aca.Services;
 using telegram_bot_aca.Utilities;
 using Telegram.Bot;
+using Telegram.Bot.Types;
 
 namespace telegram_bot_aca.Bot.Commands;
 
@@ -11,12 +12,12 @@ public class MediaUploadCommand : ITelegramCommand
     private readonly ITelegramBotClient _botClient;
     private readonly IConversionSessionStore _sessionStore;
 
-    public MediaUploadCommand(ITelegramBotClient botClient,IConversionSessionStore sessionStore)
+    public MediaUploadCommand(ITelegramBotClient botClient, IConversionSessionStore sessionStore)
     {
         _botClient = botClient;
         _sessionStore = sessionStore;
     }
-    
+
     public bool CanHandle(TelegramCommandContext context)
     {
         if (context.IsCallbackQuery || context.User == null)
@@ -27,6 +28,7 @@ public class MediaUploadCommand : ITelegramCommand
         var message = context.Update.Message;
         return message?.Video is not null || message?.Photo is { Length: > 0 } || message?.Document is not null;
     }
+
 
     public async Task HandleAsync(TelegramCommandContext context, CancellationToken cancellationToken)
     {
@@ -39,26 +41,30 @@ public class MediaUploadCommand : ITelegramCommand
             if (message.Video is not null)
             {
                 EnsureWithinCloudLimit(message.Video.FileSize);
-                var sourcePath = await DownloadTelegramFileAsync(message.Video.FileId, ".mp4", cancellationToken);
-                var hasAudio = await DetectVideoHasAudioAsync(sourcePath, ResolveFfprobePath(), cancellationToken);
-
-                _sessionStore.Set(context.ChatId, new PendingConversionSession
-                {
-                    AssetType = JobAssetType.Video,
-                    SourcePath = sourcePath,
-                    HasAudio = hasAudio
-                });
-
-                await _botClient.SendMessage(
-                    context.ChatId,
-                    "🎬 Video received. Please select conversion options via buttons.",
-                    replyMarkup: ConversionOptionCatalog.BuildVideoFormatKeyboard(),
-                    cancellationToken: cancellationToken);
+                await HandleVideoAsync(message.Video.FileId, context.ChatId, cancellationToken);
                 return;
             }
 
             if (message.Photo is { Length: > 0 })
             {
+            }
+
+            if (message.Document is not null)
+            {
+                EnsureWithinCloudLimit(message.Document.FileSize);
+                var assetInfo = DetermineAssetInfoFromDocument(message.Document);
+                if (assetInfo is null)
+                {
+                    await _botClient.SendMessage(context.ChatId, "Unsupported file type.",
+                        cancellationToken: cancellationToken);
+                    return;
+                }
+
+                var info = assetInfo.Value;
+                if (info.assetType==JobAssetType.Video)
+                {
+                    await HandleVideoAsync(message.Document.FileId, context.ChatId, cancellationToken);
+                }
             }
         }
         catch (InvalidOperationException e)
@@ -70,7 +76,42 @@ public class MediaUploadCommand : ITelegramCommand
             await _botClient.SendMessage(context.ChatId, $"Exception: {e.Message}",
                 cancellationToken: cancellationToken);
         }
-        
+    }
+
+    private async Task HandleVideoAsync(string fileId, long chatId, CancellationToken cancellationToken)
+    {
+        var sourcePath = await DownloadTelegramFileAsync(fileId, ".mp4", cancellationToken);
+        var hasAudio = await DetectVideoHasAudioAsync(sourcePath, ResolveFfprobePath(), cancellationToken);
+
+        _sessionStore.Set(chatId, new PendingConversionSession
+        {
+            AssetType = JobAssetType.Video,
+            SourcePath = sourcePath,
+            HasAudio = hasAudio
+        });
+
+        await _botClient.SendMessage(
+            chatId,
+            "🎬 Video received. Please select conversion options via buttons.",
+            replyMarkup: ConversionOptionCatalog.BuildVideoFormatKeyboard(),
+            cancellationToken: cancellationToken);
+    }
+
+    private (JobAssetType assetType, string extension)? DetermineAssetInfoFromDocument(Document document)
+    {
+        var mime = (document.MimeType ?? string.Empty).ToLowerInvariant();
+        var extension = Path.GetExtension(document.FileName ?? string.Empty).ToLowerInvariant();
+        if (extension is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".bmp" or ".ico")
+        {
+            return (JobAssetType.Image, extension);
+        }
+
+        if (extension is ".mp4" or ".mov" or ".avi" or ".mkv" or ".wmv" or ".flv" or ".webm" or ".mpg" or ".mpeg")
+        {
+            return (JobAssetType.Video, extension);
+        }
+
+        return null;
     }
 
     private async Task<bool> DetectVideoHasAudioAsync(string localPath, string ffprobePath,
@@ -121,7 +162,7 @@ public class MediaUploadCommand : ITelegramCommand
 
     private void EnsureWithinCloudLimit(long? fileSizeBytes)
     {
-        if (!fileSizeBytes.HasValue || fileSizeBytes.Value<=0)
+        if (!fileSizeBytes.HasValue || fileSizeBytes.Value <= 0)
         {
             return;
         }
@@ -130,7 +171,8 @@ public class MediaUploadCommand : ITelegramCommand
         var maxBytes = maxCloudDownloadSizeMb * 1024L * 1024L;
         if (fileSizeBytes.Value > maxBytes)
         {
-            throw new InvalidOperationException($"File is too large for Telegram cloud bot download ({fileSizeBytes.Value/(1024*1024)} MB). Current limit is {maxCloudDownloadSizeMb} MB");
+            throw new InvalidOperationException(
+                $"File is too large for Telegram cloud bot download ({fileSizeBytes.Value / (1024 * 1024)} MB). Current limit is {maxCloudDownloadSizeMb} MB");
         }
     }
 
@@ -153,7 +195,7 @@ public class MediaUploadCommand : ITelegramCommand
             //ignore
         }
     }
-    
+
     private string ResolveFfprobePath()
     {
         return MediaToolPathResolver.ResolveOrDefault("ff", "ffprobe");
